@@ -13,23 +13,66 @@ We present SHARP, an approach to photorealistic view synthesis from a single ima
 
 ## Getting started
 
-We recommend to first create a python environment:
+We recommend to first create a python environment. Note that the **Web Interface scripts expect the environment to be located at `.venv`** in the project root.
 
-```
-conda create -n sharp python=3.13
-```
+```bash
+# Creative a virtual environment named .venv
+python -m venv .venv
+source .venv/bin/activate
 
-Afterwards, you can install the project using
-
-```
+# Install dependencies
 pip install -r requirements.txt
 ```
 
 To test the installation, run
 
-```
+```bash
 sharp --help
 ```
+
+## Web Interface
+
+This project includes a modern Web UI for easy interaction.
+
+### Prerequisites
+- Node.js & npm
+- Python environment at `.venv` (as described above)
+
+### Installation
+
+1. Install root dependencies:
+```bash
+npm install
+```
+
+2. Install frontend dependencies:
+```bash
+cd app/frontend
+npm install
+cd ../..
+```
+
+### Running the App
+
+Start both the backend and frontend with a single command:
+
+```bash
+npm run dev
+```
+
+The application will start, and you can access it at `http://localhost:5173`.
+- The backend runs on port `8000`.
+- The frontend runs on port `5173`.
+
+The app handles model downloading automatically on the first run.
+
+### Features
+- **Upload Images**: Drag and drop images to automatically generate 3D Gaussian Splats.
+- **Interactive Viewer**: View your generated 3D scenes in real-time.
+- **Export options**:
+  - Download highly compressed `.ksplat` files for web use.
+  - Convert and download as standard 3D meshes (`.obj` / `.glb`).
+
 
 ## Using the CLI
 
