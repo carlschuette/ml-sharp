@@ -181,30 +181,28 @@ async def process_file_task(request_id: str, file_path: Path, output_ply_path: P
             LOGGER.info(f"Saving PLY to {output_ply_path}")
             await asyncio.get_running_loop().run_in_executor(None, save_ply, gaussians, f_px, (height, width), output_ply_path)
 
-            loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Compressing", "progress": 95}))
-            LOGGER.info(f"Compressing {output_ply_path} to ksplat...")
+            # Skip auto-compression, return PLY URL
+            # output_ksplat_path = output_ply_path.with_suffix(".ksplat")
             
-            output_ksplat_path = output_ply_path.with_suffix(".ksplat")
-            
-            def run_compression():
-                try:
-                    subprocess.run(
-                        ["node", str(CONVERT_SCRIPT), str(output_ply_path.resolve()), str(output_ksplat_path.resolve())],
-                        cwd=str(FRONTEND_DIR),
-                        check=True,
-                        capture_output=True,
-                        text=True
-                    )
-                except subprocess.CalledProcessError as e:
-                    LOGGER.error(f"Compression failed: {e.stderr}")
-                    raise Exception(f"Compression failed: {e.stderr}")
+            # def run_compression():
+            #     try:
+            #         subprocess.run(
+            #             ["node", str(CONVERT_SCRIPT), str(output_ply_path.resolve()), str(output_ksplat_path.resolve())],
+            #             cwd=str(FRONTEND_DIR),
+            #             check=True,
+            #             capture_output=True,
+            #             text=True
+            #         )
+            #     except subprocess.CalledProcessError as e:
+            #         LOGGER.error(f"Compression failed: {e.stderr}")
+            #         raise Exception(f"Compression failed: {e.stderr}")
 
-            await asyncio.get_running_loop().run_in_executor(None, run_compression)
+            # await asyncio.get_running_loop().run_in_executor(None, run_compression)
         
         loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
             "status": "Complete", 
             "progress": 100, 
-            "url": f"/outputs/{output_ksplat_path.name}"
+            "url": f"/outputs/{output_ply_path.name}"
         }))
     except Exception as e:
         LOGGER.error(f"Error processing {request_id}: {e}")
@@ -266,8 +264,73 @@ async def get_ply(filename: str):
         return FileResponse(file_path, media_type='application/octet-stream', filename=filename)
     return {"error": "File not found"}
 
+async def process_mesh_task(request_id: str, ply_path: Path, mesh_path: Path, mesh_filename: str, loop: asyncio.AbstractEventLoop):
+    try:
+        def log(msg, pct):
+            if request_id in status_queues:
+                loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": msg, "progress": pct}))
+
+        import open3d as o3d
+        from sharp.utils.gaussians import load_ply as load_gaussian_ply
+
+        log("Loading Splat Data", 10)
+        gaussians, metadata = await loop.run_in_executor(None, load_gaussian_ply, ply_path)
+        
+        log("Extracting Points", 20)
+        positions = gaussians.mean_vectors.squeeze(0).cpu().numpy()
+        colors = gaussians.colors.squeeze(0).cpu().numpy()
+        
+        # Flip orientation (Y and Z axes) to match standard 3D viewer conventions (Y-up)
+        # The original coordinates are typically Y-down, Z-forward (OpenCV style)
+        positions[:, 1] = -positions[:, 1]
+        positions[:, 2] = -positions[:, 2]
+        
+        # Clamp colors to valid range
+        colors = np.clip(colors, 0, 1)
+
+        log("Creating Point Cloud", 30)
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(positions)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        log("Estimating Normals", 40)
+        await loop.run_in_executor(None, lambda: pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)))
+        await loop.run_in_executor(None, lambda: pcd.orient_normals_consistent_tangent_plane(k=15))
+
+        log("Poisson Reconstruction", 60)
+        # Poisson reconstruction returns (mesh, densities)
+        result = await loop.run_in_executor(None, lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=9, width=0, scale=1.1, linear_fit=False
+        ))
+        mesh, densities = result
+
+        log("Cleaning Mesh", 85)
+        densities = np.asarray(densities)
+        density_threshold = np.quantile(densities, 0.05)
+        vertices_to_remove = densities < density_threshold
+        mesh.remove_vertices_by_mask(vertices_to_remove)
+        mesh.compute_vertex_normals()
+
+        log("Saving OBJ File", 95)
+        await loop.run_in_executor(None, lambda: o3d.io.write_triangle_mesh(str(mesh_path), mesh))
+
+        log("Complete", 100)
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
+            "status": "Complete", 
+            "progress": 100, 
+            "mesh_url": f"/outputs/{mesh_filename}"
+        }))
+    except ImportError:
+        LOGGER.error("Open3D not installed.")
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": "Open3D not installed on server"}))
+    except Exception as e:
+        LOGGER.error(f"Mesh conversion failed: {e}")
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": str(e)}))
+    finally:
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, None)
+
 @app.post("/convert-to-mesh")
-async def convert_to_mesh(request: dict):
+async def convert_to_mesh(background_tasks: BackgroundTasks, request: dict):
     """Convert a Gaussian splat PLY to a mesh using Poisson reconstruction."""
     ply_filename = request.get("ply_filename")
     if not ply_filename:
@@ -289,63 +352,13 @@ async def convert_to_mesh(request: dict):
     mesh_filename = ply_path.name.replace(".ply", "_mesh.obj")
     mesh_path = OUTPUT_DIR / mesh_filename
     
-    try:
-        import open3d as o3d
-        
-        LOGGER.info(f"Converting {ply_path} to mesh...")
-        
-        # Load the Gaussian splat PLY file
-        # We need to manually parse it since it's a Gaussian splat format, not standard point cloud
-        from sharp.utils.gaussians import load_ply as load_gaussian_ply
-        
-        gaussians, metadata = load_gaussian_ply(ply_path)
-        
-        # Extract point positions from Gaussians
-        positions = gaussians.mean_vectors.squeeze(0).cpu().numpy()
-        colors = gaussians.colors.squeeze(0).cpu().numpy()
-        
-        # Clamp colors to valid range
-        colors = np.clip(colors, 0, 1)
-        
-        LOGGER.info(f"Extracted {len(positions)} points from Gaussian splat")
-        
-        # Create Open3D point cloud
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(positions)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-        
-        # Estimate normals for Poisson reconstruction
-        LOGGER.info("Estimating normals...")
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
-        pcd.orient_normals_consistent_tangent_plane(k=15)
-        
-        # Perform Poisson surface reconstruction
-        LOGGER.info("Performing Poisson surface reconstruction...")
-        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=9, width=0, scale=1.1, linear_fit=False
-        )
-        
-        # Remove low-density vertices (noise)
-        densities = np.asarray(densities)
-        density_threshold = np.quantile(densities, 0.05)
-        vertices_to_remove = densities < density_threshold
-        mesh.remove_vertices_by_mask(vertices_to_remove)
-        
-        # Transfer colors from point cloud to mesh vertices
-        mesh.compute_vertex_normals()
-        
-        # Save the mesh
-        LOGGER.info(f"Saving mesh to {mesh_path}")
-        o3d.io.write_triangle_mesh(str(mesh_path), mesh)
-        
-        return {"mesh_url": f"/outputs/{mesh_filename}"}
-        
-    except ImportError:
-        LOGGER.error("Open3D not installed. Please install it with: pip install open3d")
-        return {"error": "Open3D is required for mesh conversion. Install with: pip install open3d"}
-    except Exception as e:
-        LOGGER.error(f"Mesh conversion failed: {e}")
-        return {"error": str(e)}
+    request_id = str(uuid.uuid4())
+    status_queues[request_id] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    
+    background_tasks.add_task(process_mesh_task, request_id, ply_path, mesh_path, mesh_filename, loop)
+    
+    return {"status": "queued", "request_id": request_id}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

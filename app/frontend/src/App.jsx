@@ -4,6 +4,7 @@ import axios from 'axios';
 import { Upload, Loader2, Maximize2, CheckCircle2, Image as ImageIcon, Download, Box, Plus } from 'lucide-react';
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
 import { motion, AnimatePresence } from 'framer-motion';
+import { Settings, X, Sliders } from 'lucide-react';
 
 // --- Components ---
 
@@ -89,15 +90,16 @@ function SidebarItem({ item, isSelected, onClick }) {
           <p className="text-xs text-slate-500 truncate">{item.status}</p>
         </div>
         {item.status === 'Complete' && (
-          <a
-            href={item.resultUrl}
-            download={item.file.name.replace(/\.[^/.]+$/, "") + ".ksplat"}
-            onClick={(e) => e.stopPropagation()}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onClickDownload(item);
+            }}
             className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"
-            title="Download Compresed Splat (.ksplat)"
+            title="Download / Compress"
           >
             <Download className="w-4 h-4" />
-          </a>
+          </button>
         )}
       </div>
 
@@ -119,10 +121,187 @@ function SidebarItem({ item, isSelected, onClick }) {
   )
 }
 
+function CompressionModal({ item, onClose }) {
+  const [compressionLevel, setCompressionLevel] = useState(1);
+  const [alphaThreshold, setAlphaThreshold] = useState(1);
+  const [shDegree, setShDegree] = useState(0);
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+
+  const handleExport = async () => {
+    setIsExporting(true);
+    setExportProgress(0);
+
+    try {
+      // GaussianSplats3D.PlyLoader.loadFromURL expects certain callbacks
+      const onProgress = (percent) => setExportProgress(percent);
+      const progressiveLoad = false;
+      const onProgressiveLoadSectionProgress = null;
+      const optimizeSplatData = true;
+      const headers = null;
+
+      const splatBuffer = await GaussianSplats3D.PlyLoader.loadFromURL(
+        item.resultUrl,
+        onProgress,
+        progressiveLoad,
+        onProgressiveLoadSectionProgress,
+        alphaThreshold,
+        compressionLevel,
+        optimizeSplatData,
+        shDegree,
+        headers
+      );
+
+      const filename = item.file.name.replace(/\.[^/.]+$/, "") + ".ksplat";
+      GaussianSplats3D.KSplatLoader.downloadFile(splatBuffer, filename);
+      onClose();
+    } catch (err) {
+      console.error("Export failed:", err);
+      alert("Export failed: " + err.message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ scale: 0.9, opacity: 0, y: 20 }}
+        animate={{ scale: 1, opacity: 1, y: 0 }}
+        exit={{ scale: 0.9, opacity: 0, y: 20 }}
+        className="bg-slate-800 border border-slate-700 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="p-6 border-b border-slate-700 flex justify-between items-center bg-slate-800/50">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-indigo-500/20 rounded-lg">
+              <Settings className="w-5 h-5 text-indigo-400" />
+            </div>
+            <div>
+              <h3 className="font-bold text-lg text-white">Compress & Download</h3>
+              <p className="text-xs text-slate-400">Configure .ksplat export settings</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-slate-700 rounded-full text-slate-400 transition-colors">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-6 space-y-6">
+          {/* Compression Level */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-center text-sm">
+              <label className="text-slate-300 font-medium">Compression Level</label>
+              <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
+                Level {compressionLevel}
+              </span>
+            </div>
+            <div className="flex gap-2">
+              {[0, 1, 2].map(level => (
+                <button
+                  key={level}
+                  onClick={() => setCompressionLevel(level)}
+                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-all ${compressionLevel === level
+                    ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                    : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                    }`}
+                >
+                  {level === 0 ? 'None' : level === 1 ? '16-bit' : '8-bit'}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-slate-500 italic">
+              {compressionLevel === 0 && "Lossless conversion. Large file size."}
+              {compressionLevel === 1 && "Optimized 16-bit precision. Recommended."}
+              {compressionLevel === 2 && "Maximum 8-bit compression. Smallest size."}
+            </p>
+          </div>
+
+          {/* Alpha Threshold */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-center text-sm">
+              <label className="text-slate-300 font-medium">Alpha Threshold</label>
+              <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
+                {alphaThreshold}/255
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="255"
+              value={alphaThreshold}
+              onChange={(e) => setAlphaThreshold(parseInt(e.target.value))}
+              className="w-full accent-indigo-500"
+            />
+            <p className="text-[10px] text-slate-500 italic"> Removes splats with opacity lower than this value. Improves performance. </p>
+          </div>
+
+          {/* SH Degree */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-center text-sm">
+              <label className="text-slate-300 font-medium">Spherical Harmonics</label>
+              <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
+                Degree {shDegree}
+              </span>
+            </div>
+            <div className="flex gap-2">
+              {[0, 1, 2].map(deg => (
+                <button
+                  key={deg}
+                  onClick={() => setShDegree(deg)}
+                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-all ${shDegree === deg
+                    ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                    : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                    }`}
+                >
+                  Deg {deg}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="p-6 bg-slate-900/30 border-t border-slate-700 space-y-4">
+          {isExporting ? (
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs text-slate-400 mb-1">
+                <span>Optimizing and compressing...</span>
+                <span>{Math.round(exportProgress)}%</span>
+              </div>
+              <div className="h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                <motion.div
+                  className="h-full bg-indigo-500"
+                  initial={{ width: 0 }}
+                  animate={{ width: `${exportProgress}%` }}
+                />
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={handleExport}
+              className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold shadow-lg shadow-indigo-500/20 transition-all transform hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-2"
+            >
+              <Download className="w-4 h-4" />
+              Download .ksplat
+            </button>
+          )}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+}
+
 function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatus }) {
   if (selectedItem && selectedItem.resultUrl && selectedItem.status === 'Complete') {
     const isConverting = meshConversionStatus?.itemId === selectedItem.id && meshConversionStatus?.status === 'converting';
     const meshUrl = selectedItem.meshUrl;
+    const conversionMessage = meshConversionStatus?.message || "Converting...";
 
     return (
       <div className="flex-1 h-full relative bg-black">
@@ -154,7 +333,7 @@ function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatu
               {isConverting ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Converting...
+                  {conversionMessage}
                 </>
               ) : (
                 <>
@@ -203,6 +382,7 @@ function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatu
 function App() {
   const [queue, setQueue] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
+  const [compressionModalItem, setCompressionModalItem] = useState(null);
 
   // Handle batch file selection
   const handleUpload = async (e) => {
@@ -293,7 +473,7 @@ function App() {
   const handleConvertToMesh = async (item) => {
     if (!item.resultUrl) return;
 
-    setMeshConversionStatus({ itemId: item.id, status: 'converting' });
+    setMeshConversionStatus({ itemId: item.id, status: 'converting', message: 'Starting...' });
 
     try {
       // Extract the PLY filename from the URL
@@ -303,16 +483,48 @@ function App() {
         ply_filename: plyFilename
       });
 
-      if (response.data.error) {
-        throw new Error(response.data.error);
+      const requestId = response.data.request_id;
+      if (!requestId) {
+        throw new Error(response.data.error || 'Failed to start conversion');
       }
 
-      updateItemMeshUrl(item.id, response.data.mesh_url);
-      setMeshConversionStatus({ itemId: item.id, status: 'complete' });
+      // Listen to SSE for mesh conversion progress
+      const evtSource = new EventSource(`/api/events/${requestId}`);
+
+      evtSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.error) {
+          console.error("Mesh conversion event error:", data.error);
+          setMeshConversionStatus({ itemId: item.id, status: 'error', error: data.error });
+          alert('Mesh conversion failed: ' + data.error);
+          evtSource.close();
+          return;
+        }
+
+        if (data.status) {
+          setMeshConversionStatus(prev => ({
+            ...prev,
+            message: data.status
+          }));
+        }
+
+        if (data.mesh_url) {
+          updateItemMeshUrl(item.id, data.mesh_url);
+          setMeshConversionStatus({ itemId: item.id, status: 'complete' });
+          evtSource.close();
+        }
+      };
+
+      evtSource.onerror = (err) => {
+        console.error("Mesh SSE Error", err);
+        evtSource.close();
+        // Don't necessarily show error alert here as it might just be the connection closing after completion
+      };
+
     } catch (err) {
       console.error('Mesh conversion error:', err);
       setMeshConversionStatus({ itemId: item.id, status: 'error', error: err.message });
-      // Show error alert
       alert('Failed to convert to mesh: ' + err.message);
     }
   };
@@ -347,6 +559,7 @@ function App() {
                 item={item}
                 isSelected={selectedId === item.id}
                 onClick={() => setSelectedId(item.id)}
+                onClickDownload={setCompressionModalItem}
               />
             ))}
           </AnimatePresence>
@@ -372,6 +585,15 @@ function App() {
           meshConversionStatus={meshConversionStatus}
         />
       </main>
+
+      <AnimatePresence>
+        {compressionModalItem && (
+          <CompressionModal
+            item={compressionModalItem}
+            onClose={() => setCompressionModalItem(null)}
+          />
+        )}
+      </AnimatePresence>
     </div>
   );
 }
