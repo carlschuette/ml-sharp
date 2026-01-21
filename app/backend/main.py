@@ -297,9 +297,16 @@ def mesh_conversion_worker(ply_path: Path, mesh_path: Path, log_callback):
 
     log_callback("Poisson Reconstruction", 60)
     # Poisson reconstruction returns (mesh, densities)
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-        pcd, depth=9, width=0, scale=1.1, linear_fit=False
-    )
+    # Using depth=8 to avoid "Failed to close loop" errors which occur at higher depths
+    try:
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=8, width=0, scale=1.1, linear_fit=False
+        )
+    except Exception as e:
+        LOGGER.warning(f"Poisson reconstruction failed with depth=8: {e}. Retrying with depth=6.")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=6, width=0, scale=1.1, linear_fit=False
+        )
 
     log_callback("Cleaning Mesh", 85)
     densities = np.asarray(densities)

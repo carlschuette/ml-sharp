@@ -5,7 +5,7 @@
         "predev": "lsof -ti:8000 | xargs kill -9 || true",
         "dev": "echo 'Starting development server... This might take some time.' && concurrently \"npm run dev:backend\" \"npm run dev:frontend\" --kill-others --names \"BACKEND,FRONTEND\" --prefix-colors \"blue,green\"",
         "dev:frontend": "wait-on tcp:8000 && npm run dev --prefix app/frontend",
-        "dev:backend": ".venv/bin/python app/backend/download_models.py && .venv/bin/python app/backend/main.py",
+        "dev:backend": "node scripts/start_backend.js",
         "build": "npm run build --prefix app/frontend",
         "lint": "npm run lint --prefix app/frontend"
     },
