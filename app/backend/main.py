@@ -264,65 +264,70 @@ async def get_ply(filename: str):
         return FileResponse(file_path, media_type='application/octet-stream', filename=filename)
     return {"error": "File not found"}
 
+def mesh_conversion_worker(ply_path: Path, mesh_path: Path, log_callback):
+    """Synchronous worker for heavy mesh conversion tasks."""
+    try:
+        import open3d as o3d
+        from sharp.utils.gaussians import load_ply as load_gaussian_ply
+    except ImportError:
+        raise ImportError("Open3D not installed on server")
+
+    log_callback("Loading Splat Data", 10)
+    gaussians, metadata = load_gaussian_ply(ply_path)
+    
+    log_callback("Extracting Points", 20)
+    positions = gaussians.mean_vectors.squeeze(0).cpu().numpy()
+    colors = gaussians.colors.squeeze(0).cpu().numpy()
+    
+    # Flip orientation (Y and Z axes) to match standard 3D viewer conventions (Y-up)
+    positions[:, 1] = -positions[:, 1]
+    positions[:, 2] = -positions[:, 2]
+    
+    # Clamp colors to valid range
+    colors = np.clip(colors, 0, 1)
+
+    log_callback("Creating Point Cloud", 30)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(positions)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    log_callback("Estimating Normals", 40)
+    pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+    pcd.orient_normals_consistent_tangent_plane(k=15)
+
+    log_callback("Poisson Reconstruction", 60)
+    # Poisson reconstruction returns (mesh, densities)
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=9, width=0, scale=1.1, linear_fit=False
+    )
+
+    log_callback("Cleaning Mesh", 85)
+    densities = np.asarray(densities)
+    density_threshold = np.quantile(densities, 0.05)
+    vertices_to_remove = densities < density_threshold
+    mesh.remove_vertices_by_mask(vertices_to_remove)
+    mesh.compute_vertex_normals()
+
+    log_callback("Saving OBJ File", 95)
+    o3d.io.write_triangle_mesh(str(mesh_path), mesh)
+    
+    log_callback("Complete", 100)
+
 async def process_mesh_task(request_id: str, ply_path: Path, mesh_path: Path, mesh_filename: str, loop: asyncio.AbstractEventLoop):
     try:
         def log(msg, pct):
             if request_id in status_queues:
                 loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": msg, "progress": pct}))
 
-        import open3d as o3d
-        from sharp.utils.gaussians import load_ply as load_gaussian_ply
+        # Run the heavy lifting in a separate thread so we don't block the main loop
+        # This allows other requests (and SSE heartbeats) to continue processing
+        await loop.run_in_executor(None, mesh_conversion_worker, ply_path, mesh_path, log)
 
-        log("Loading Splat Data", 10)
-        gaussians, metadata = await loop.run_in_executor(None, load_gaussian_ply, ply_path)
-        
-        log("Extracting Points", 20)
-        positions = gaussians.mean_vectors.squeeze(0).cpu().numpy()
-        colors = gaussians.colors.squeeze(0).cpu().numpy()
-        
-        # Flip orientation (Y and Z axes) to match standard 3D viewer conventions (Y-up)
-        # The original coordinates are typically Y-down, Z-forward (OpenCV style)
-        positions[:, 1] = -positions[:, 1]
-        positions[:, 2] = -positions[:, 2]
-        
-        # Clamp colors to valid range
-        colors = np.clip(colors, 0, 1)
-
-        log("Creating Point Cloud", 30)
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(positions)
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-
-        log("Estimating Normals", 40)
-        await loop.run_in_executor(None, lambda: pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)))
-        await loop.run_in_executor(None, lambda: pcd.orient_normals_consistent_tangent_plane(k=15))
-
-        log("Poisson Reconstruction", 60)
-        # Poisson reconstruction returns (mesh, densities)
-        result = await loop.run_in_executor(None, lambda: o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
-            pcd, depth=9, width=0, scale=1.1, linear_fit=False
-        ))
-        mesh, densities = result
-
-        log("Cleaning Mesh", 85)
-        densities = np.asarray(densities)
-        density_threshold = np.quantile(densities, 0.05)
-        vertices_to_remove = densities < density_threshold
-        mesh.remove_vertices_by_mask(vertices_to_remove)
-        mesh.compute_vertex_normals()
-
-        log("Saving OBJ File", 95)
-        await loop.run_in_executor(None, lambda: o3d.io.write_triangle_mesh(str(mesh_path), mesh))
-
-        log("Complete", 100)
         loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
             "status": "Complete", 
             "progress": 100, 
             "mesh_url": f"/outputs/{mesh_filename}"
         }))
-    except ImportError:
-        LOGGER.error("Open3D not installed.")
-        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": "Open3D not installed on server"}))
     except Exception as e:
         LOGGER.error(f"Mesh conversion failed: {e}")
         loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": str(e)}))

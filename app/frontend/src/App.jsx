@@ -325,15 +325,28 @@ function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatu
             <button
               onClick={() => onConvertToMesh(selectedItem)}
               disabled={isConverting}
-              className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-semibold shadow-lg transition-all transform hover:-translate-y-0.5 active:translate-y-0 ${isConverting
-                ? 'bg-slate-600 text-slate-300 cursor-not-allowed'
+              className={`relative overflow-hidden flex items-center gap-2 px-4 py-2.5 rounded-xl font-semibold shadow-lg transition-all transform hover:-translate-y-0.5 active:translate-y-0 ${isConverting
+                ? 'bg-slate-700 text-white cursor-not-allowed border border-slate-600'
                 : 'bg-violet-600 hover:bg-violet-500 text-white shadow-violet-900/30'
                 }`}
             >
               {isConverting ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  {conversionMessage}
+                  {/* Progress Bar Background */}
+                  <div className="absolute inset-0 bg-slate-700 z-0" />
+                  <motion.div
+                    className="absolute inset-y-0 left-0 bg-violet-600/50 z-0"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${meshConversionStatus?.progress || 0}%` }}
+                    transition={{ ease: "linear", duration: 0.2 }}
+                  />
+
+                  {/* Content */}
+                  <div className="relative z-10 flex items-center gap-2 min-w-[140px] justify-center">
+                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                    <span className="truncate max-w-[200px]">{conversionMessage}</span>
+                    <span className="text-xs opacity-70 ml-1">{Math.round(meshConversionStatus?.progress || 0)}%</span>
+                  </div>
                 </>
               ) : (
                 <>
@@ -505,7 +518,8 @@ function App() {
         if (data.status) {
           setMeshConversionStatus(prev => ({
             ...prev,
-            message: data.status
+            message: data.status,
+            progress: data.progress
           }));
         }
 
@@ -519,7 +533,17 @@ function App() {
       evtSource.onerror = (err) => {
         console.error("Mesh SSE Error", err);
         evtSource.close();
-        // Don't necessarily show error alert here as it might just be the connection closing after completion
+
+        setMeshConversionStatus(prev => {
+          // If we're already complete or error, don't overwrite
+          if (prev?.status === 'complete' || prev?.status === 'error') return prev;
+
+          return {
+            itemId: item.id,
+            status: 'error',
+            error: 'Connection lost or conversion failed'
+          };
+        });
       };
 
     } catch (err) {
