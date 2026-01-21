@@ -67,7 +67,7 @@ function Viewer({ url }) {
   );
 }
 
-function SidebarItem({ item, isSelected, onClick }) {
+function SidebarItem({ item, isSelected, onClick, onClickDownload }) {
   return (
     <motion.div
       layout
