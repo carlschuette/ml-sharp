@@ -1,0 +1,15 @@
+{
+    "name": "gaussian-splat-root",
+    "private": true,
+    "scripts": {
+        "predev": "lsof -ti:8000 | xargs kill -9 || true",
+        "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\" --kill-others --names \"BACKEND,FRONTEND\" --prefix-colors \"blue,green\"",
+        "dev:frontend": "npm run dev --prefix app/frontend",
+        "dev:backend": ".venv/bin/python app/backend/main.py",
+        "build": "npm run build --prefix app/frontend",
+        "lint": "npm run lint --prefix app/frontend"
+    },
+    "devDependencies": {
+        "concurrently": "^9.2.1"
+    }
+}
