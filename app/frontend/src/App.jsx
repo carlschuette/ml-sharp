@@ -837,12 +837,12 @@ function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatu
   return (
     <div className="flex-1 h-full flex items-center justify-center p-8">
       <div className="max-w-xl w-full">
-        <div className="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-12 backdrop-blur-sm text-center">
-          <div className="w-20 h-20 bg-slate-700/50 rounded-full flex items-center justify-center mx-auto mb-6">
-            <Upload className="w-10 h-10 text-indigo-400" />
+        <div className="bg-slate-800/50 border-2 border-dashed border-slate-700/50 hover:border-indigo-500/50 rounded-2xl p-12 backdrop-blur-sm text-center transition-all group">
+          <div className="w-20 h-20 bg-slate-700/50 group-hover:bg-indigo-500/10 rounded-full flex items-center justify-center mx-auto mb-6 transition-colors">
+            <Upload className="w-10 h-10 text-indigo-400 group-hover:text-indigo-300" />
           </div>
           <h2 className="text-2xl font-bold text-white mb-2">Upload Images</h2>
-          <p className="text-slate-400 mb-8">Select one or more images to generate 3D Splats.</p>
+          <p className="text-slate-400 mb-8">Select or drag images here to generate 3D Splats.</p>
 
           <label className="inline-flex cursor-pointer">
             <input
@@ -869,6 +869,7 @@ function App() {
   const [selectedId, setSelectedId] = useState(null);
   const [compressionModalItem, setCompressionModalItem] = useState(null);
   const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Fetch history on mount
   useEffect(() => {
@@ -885,11 +886,14 @@ function App() {
     fetchHistory();
   }, []);
 
-  // Handle batch file selection
-  const handleUpload = async (e) => {
-    if (!e.target.files) return;
+  // Handle common file processing
+  const handleFiles = (files) => {
+    if (!files || files.length === 0) return;
 
-    const newItems = Array.from(e.target.files).map(file => ({
+    const fileArray = Array.from(files).filter(file => file.type.startsWith('image/'));
+    if (fileArray.length === 0) return;
+
+    const newItems = fileArray.map(file => ({
       id: Math.random().toString(36).substr(2, 9),
       file,
       status: 'Queued',
@@ -903,6 +907,13 @@ function App() {
 
     // Trigger processing for each new item
     newItems.forEach(item => processItem(item));
+  };
+
+  // Handle batch file selection
+  const handleUpload = async (e) => {
+    if (e.target.files) {
+      handleFiles(e.target.files);
+    }
   };
 
   const processItem = async (item) => {
@@ -1048,7 +1059,15 @@ function App() {
   const selectedItem = queue.find(i => i.id === selectedId);
 
   return (
-    <div className="h-screen bg-slate-900 text-white font-sans flex overflow-hidden">
+    <div
+      className="h-screen bg-slate-900 text-white font-sans flex overflow-hidden relative"
+      onDragOver={(e) => {
+        e.preventDefault();
+        if (e.dataTransfer.types.includes('Files')) {
+          setIsDragging(true);
+        }
+      }}
+    >
 
       {/* Sidebar */}
       <aside className="w-80 bg-slate-900/50 backdrop-blur border-r border-indigo-500/10 flex flex-col z-10">
@@ -1115,6 +1134,34 @@ function App() {
             item={compressionModalItem}
             onClose={() => setCompressionModalItem(null)}
           />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {isDragging && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[100] flex items-center justify-center bg-indigo-600/20 backdrop-blur-md border-4 border-dashed border-indigo-500/50 m-4 rounded-3xl pointer-events-auto"
+            onDragOver={(e) => e.preventDefault()}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDragging(false);
+              handleFiles(e.dataTransfer.files);
+            }}
+          >
+            <div className="bg-slate-900/90 p-12 rounded-3xl border border-indigo-500/30 shadow-2xl flex flex-col items-center gap-6 text-center">
+              <div className="w-24 h-24 bg-indigo-500/20 rounded-full flex items-center justify-center animate-bounce">
+                <Upload className="w-12 h-12 text-indigo-400" />
+              </div>
+              <div>
+                <h2 className="text-3xl font-bold text-white mb-2">Drop to Upload</h2>
+                <p className="text-slate-400 text-lg">Your images will be converted to 3D splats</p>
+              </div>
+            </div>
+          </motion.div>
         )}
       </AnimatePresence>
     </div>
