@@ -100,7 +100,7 @@ async def startup_event():
     load_model()
 
 @torch.no_grad()
-def predict_image(image_np: np.ndarray, f_px: float, request_id: str, loop: asyncio.AbstractEventLoop) -> tuple:
+def predict_image(image_np: np.ndarray, f_px: float, request_id: str, loop: asyncio.AbstractEventLoop, alpha_mask: np.ndarray = None) -> tuple:
     internal_shape = (1536, 1536)
     
     def log(msg, pct):
@@ -148,6 +148,42 @@ def predict_image(image_np: np.ndarray, f_px: float, request_id: str, loop: asyn
         gaussians_ndc, torch.eye(4).to(device), intrinsics_resized, internal_shape
     )
     
+    # Apply alpha mask if provided to deal with transparency
+    if alpha_mask is not None:
+        try:
+            log("Applying Alpha Mask", 85)
+            h_out = gaussian_predictor.output_resolution
+            w_out = gaussian_predictor.output_resolution
+            
+            # Convert mask to tensor and move to device
+            alpha_pt = torch.from_numpy(alpha_mask).float().to(device)
+            # Add batch and channel dimensions for interpolate [1, 1, H, W]
+            alpha_pt = alpha_pt[None, None]
+            
+            # Resize mask to output resolution
+            # We use the same bilinear interpolation used for the image to stay aligned
+            mask_resized = F.interpolate(
+                alpha_pt,
+                size=(h_out, w_out),
+                mode="bilinear",
+                align_corners=True,
+            )
+            
+            # The opacities are flattened as [B, N*H*W] where N is number of layers
+            # We need to determine N
+            total_elements = gaussians.opacities.shape[1]
+            num_layers = total_elements // (h_out * w_out)
+            
+            # Repeat mask for each layer and flatten to match opacities shape
+            mask_final = mask_resized.repeat(1, num_layers, 1, 1).flatten(1, 3)
+            
+            # Multiply opacities by mask
+            new_opacities = gaussians.opacities * mask_final
+            gaussians = gaussians._replace(opacities=new_opacities)
+            LOGGER.info(f"Applied alpha mask to {request_id}")
+        except Exception as e:
+            LOGGER.error(f"Failed to apply alpha mask: {e}")
+
     return gaussians
 
 async def process_file_task(request_id: str, file_path: Path, output_ply_path: Path, loop: asyncio.AbstractEventLoop):
@@ -171,11 +207,23 @@ async def process_file_task(request_id: str, file_path: Path, output_ply_path: P
             # but we made it `async def`, so it runs on main loop.
             # To avoid freezing the server (SSE heartbeats etc), we should ideally offload to thread.
             
-            image, _, f_px = await asyncio.get_running_loop().run_in_executor(None, io.load_rgb, file_path)
-            height, width = image.shape[:2]
+            # Load image with potential alpha channel (remove_alpha=False)
+            image_rgba, _, f_px = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: io.load_rgb(file_path, remove_alpha=False)
+            )
+            height, width = image_rgba.shape[:2]
+            
+            # Extract RGB and Alpha if present
+            if image_rgba.shape[2] == 4:
+                LOGGER.info(f"Image has alpha channel, extracting mask for {request_id}")
+                image = image_rgba[:, :, :3]
+                alpha_mask = image_rgba[:, :, 3] / 255.0
+            else:
+                image = image_rgba
+                alpha_mask = None
             
             # Run prediction in executor to not block event loop (keep other SSE streams alive)
-            gaussians = await asyncio.get_running_loop().run_in_executor(None, predict_image, image, f_px, request_id, loop)
+            gaussians = await asyncio.get_running_loop().run_in_executor(None, predict_image, image, f_px, request_id, loop, alpha_mask)
             
             loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Saving PLY File", "progress": 90}))
             LOGGER.info(f"Saving PLY to {output_ply_path}")
