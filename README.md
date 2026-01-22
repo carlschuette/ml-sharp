@@ -12,35 +12,36 @@ Easily generate, view, and export 3D Gaussian Splats from a single image.
 
 ### Installation
 
-1.  **Setup Python Environment**
-    The Web UI specifically looks for a virtual environment named `.venv` in the project root.
+The easiest way to install is to use the provided installation scripts:
 
-    ```bash
-    python -m venv .venv
-    source .venv/bin/activate  # On Windows: .venv\Scripts\activate.bat
-    pip install -r requirements.txt
-    ```
+**On macOS/Linux:**
+```bash
+./install.sh
+```
 
-2.  **Install Dependencies**
-    Install the Node.js dependencies for the project wrapper and the frontend.
+**On Windows:**
+```powershell
+.\install.bat
+```
 
-    ```bash
-    # Install root dependencies
-    npm install
-
-    # Install frontend dependencies
-    cd app/frontend
-    npm install
-    cd ../..
-    ```
+The script will automatically set up a Python virtual environment, install all dependencies, and prepare the project.
 
 ### Running the App
 
-Start the development server with a single command. This will launch both the Python backend and the React frontend.
+Once installed, you can start the application using the run scripts:
 
+**On macOS/Linux:**
 ```bash
-npm run dev
+./run.sh
 ```
+
+**On Windows:**
+```powershell
+.\run.bat
+```
+
+This will launch both the Python backend and the React frontend.
+
 
 *   **Frontend**: `http://localhost:5173`
 *   **Backend**: `http://localhost:8000`
