@@ -264,6 +264,48 @@ async def get_ply(filename: str):
         return FileResponse(file_path, media_type='application/octet-stream', filename=filename)
     return {"error": "File not found"}
 
+@app.get("/uploads/{filename}")
+async def get_upload(filename: str):
+    file_path = UPLOAD_DIR / filename
+    if file_path.exists():
+        return FileResponse(file_path)
+    return {"error": "File not found"}
+
+@app.get("/history")
+async def get_history():
+    generations = []
+    # Find all PLY files in the outputs directory
+    for ply_path in OUTPUT_DIR.glob("*.ply"):
+        request_id = ply_path.stem
+        
+        # Find corresponding upload image
+        image_url = None
+        for ext in ["jpg", "jpeg", "png", "webp", "HEIC", "heic"]:
+            img_path = UPLOAD_DIR / f"{request_id}.{ext}"
+            if img_path.exists():
+                image_url = f"/uploads/{img_path.name}"
+                break
+        
+        # Check for other formats
+        has_mesh = (OUTPUT_DIR / f"{request_id}_mesh.obj").exists()
+        has_ksplat = (OUTPUT_DIR / f"{request_id}.ksplat").exists()
+        
+        generations.append({
+            "id": request_id,
+            "status": "Complete",
+            "progress": 100,
+            "resultUrl": f"/outputs/{ply_path.name}",
+            "meshUrl": f"/outputs/{request_id}_mesh.obj" if has_mesh else None,
+            "ksplatUrl": f"/outputs/{request_id}.ksplat" if has_ksplat else None,
+            "imageUrl": image_url,
+            "filename": ply_path.name
+        })
+    
+    # Sort by modification time (newest first)
+    generations.sort(key=lambda x: (OUTPUT_DIR / x["filename"]).stat().st_mtime, reverse=True)
+    
+    return generations
+
 def mesh_conversion_worker(ply_path: Path, mesh_path: Path, log_callback):
     """Synchronous worker for heavy mesh conversion tasks."""
     try:
@@ -369,6 +411,124 @@ async def convert_to_mesh(background_tasks: BackgroundTasks, request: dict):
     loop = asyncio.get_running_loop()
     
     background_tasks.add_task(process_mesh_task, request_id, ply_path, mesh_path, mesh_filename, loop)
+    
+    return {"status": "queued", "request_id": request_id}
+
+def apply_depth_transforms_worker(ply_path: Path, output_path: Path, depth_range: tuple, depth_stretch: float, log_callback):
+    """Apply depth stretch and filtering to a PLY file."""
+    from sharp.utils.gaussians import load_ply as load_gaussian_ply, save_ply, Gaussians3D
+    
+    log_callback("Loading Splat Data", 10)
+    gaussians, metadata = load_gaussian_ply(ply_path)
+    
+    log_callback("Applying Depth Transforms", 30)
+    
+    # Get mean vectors (positions)
+    mean_vectors = gaussians.mean_vectors.clone()  # Shape: [1, N, 3]
+    
+    # The Z coordinate represents depth from origin
+    z_coords = mean_vectors[0, :, 2]  # Shape: [N]
+    
+    # Apply depth stretch to Z coordinates
+    if depth_stretch != 1.0:
+        mean_vectors[0, :, 2] = z_coords * depth_stretch
+        z_coords = mean_vectors[0, :, 2]  # Update after stretch
+    
+    log_callback("Filtering by Depth Range", 50)
+    
+    # Filter by depth range (based on absolute Z value from origin)
+    abs_z = torch.abs(z_coords)
+    min_depth, max_depth = depth_range
+    mask = (abs_z >= min_depth) & (abs_z <= max_depth)
+    
+    # Count how many splats are kept
+    original_count = mean_vectors.shape[1]
+    kept_count = mask.sum().item()
+    LOGGER.info(f"Depth filtering: keeping {kept_count}/{original_count} splats (range {min_depth}-{max_depth}m)")
+    
+    log_callback(f"Kept {kept_count}/{original_count} splats", 70)
+    
+    # Apply mask to all Gaussian properties
+    filtered_gaussians = Gaussians3D(
+        mean_vectors=mean_vectors[:, mask, :],
+        quaternions=gaussians.quaternions[:, mask, :],
+        singular_values=gaussians.singular_values[:, mask, :],
+        opacities=gaussians.opacities[:, mask],
+        colors=gaussians.colors[:, mask, :],
+    )
+    
+    log_callback("Saving Modified PLY", 85)
+    
+    # Save the modified PLY
+    save_ply(filtered_gaussians, metadata.focal_length_px, metadata.resolution_px, output_path)
+    
+    log_callback("Complete", 100)
+    return kept_count, original_count
+
+async def process_depth_transforms_task(request_id: str, ply_path: Path, output_path: Path, 
+                                         depth_range: tuple, depth_stretch: float, loop: asyncio.AbstractEventLoop):
+    try:
+        def log(msg, pct):
+            if request_id in status_queues:
+                loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": msg, "progress": pct}))
+
+        # Run the heavy lifting in a separate thread
+        kept_count, original_count = await loop.run_in_executor(
+            None, apply_depth_transforms_worker, ply_path, output_path, depth_range, depth_stretch, log
+        )
+
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
+            "status": "Complete", 
+            "progress": 100, 
+            "url": f"/outputs/{output_path.name}",
+            "kept_count": kept_count,
+            "original_count": original_count
+        }))
+    except Exception as e:
+        LOGGER.error(f"Depth transform failed: {e}")
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": str(e)}))
+    finally:
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, None)
+
+@app.post("/apply-depth-transforms")
+async def apply_depth_transforms(background_tasks: BackgroundTasks, request: dict):
+    """Apply depth stretch and filtering to a Gaussian splat PLY file."""
+    ply_filename = request.get("ply_filename")
+    depth_range = request.get("depth_range", [0.1, 100])
+    depth_stretch = request.get("depth_stretch", 1.0)
+    
+    if not ply_filename:
+        return {"error": "ply_filename is required"}
+    
+    ply_path = OUTPUT_DIR / ply_filename
+    
+    # Handle ksplat files by using original PLY
+    if ply_path.suffix == '.ksplat':
+        possible_ply = ply_path.with_suffix('.ply')
+        if possible_ply.exists():
+            ply_path = possible_ply
+    
+    if not ply_path.exists():
+        return {"error": "PLY file not found"}
+    
+    # Generate output filename with transforms applied
+    base_name = ply_path.stem
+    output_filename = f"{base_name}_depth_modified.ply"
+    output_path = OUTPUT_DIR / output_filename
+    
+    request_id = str(uuid.uuid4())
+    status_queues[request_id] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    
+    background_tasks.add_task(
+        process_depth_transforms_task, 
+        request_id, 
+        ply_path, 
+        output_path, 
+        tuple(depth_range), 
+        float(depth_stretch), 
+        loop
+    )
     
     return {"status": "queued", "request_id": request_id}
 

@@ -1,23 +1,28 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
-import { Upload, Loader2, Maximize2, CheckCircle2, Image as ImageIcon, Download, Box, Plus } from 'lucide-react';
+import { Upload, Loader2, Maximize2, CheckCircle2, Image as ImageIcon, Download, Box, Plus, RotateCcw } from 'lucide-react';
 import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Settings, X, Sliders } from 'lucide-react';
+import * as THREE from 'three';
 
 // --- Components ---
 
-function Viewer({ url }) {
+function Viewer({ url, depthRange, depthStretch, onSplatClick, viewerRefExternal }) {
   const containerRef = useRef(null);
   const viewerRef = useRef(null);
+  const [sceneLoaded, setSceneLoaded] = useState(false);
+  const baseScaleRef = useRef([1.5, 1.5, 1.5]);
 
+  // Initialize viewer
   useEffect(() => {
     if (!containerRef.current || !url) return;
 
     // Cleanup previous viewer if exists
     if (viewerRef.current) {
       viewerRef.current.dispose();
+      setSceneLoaded(false);
     }
 
     const viewer = new GaussianSplats3D.Viewer({
@@ -29,9 +34,11 @@ function Viewer({ url }) {
     });
 
     viewerRef.current = viewer;
+    if (viewerRefExternal) {
+      viewerRefExternal.current = viewer;
+    }
 
-    // Remove zoom limits by accessing the controls
-    // The viewer uses OrbitControls internally
+    // Remove zoom limits
     if (viewer.controls) {
       viewer.controls.minDistance = 0;
       viewer.controls.maxDistance = Infinity;
@@ -46,12 +53,19 @@ function Viewer({ url }) {
     })
       .then(() => {
         viewer.start();
-        // Also try to remove zoom limits after scene loads
-        // in case controls are initialized during start
         if (viewer.controls) {
           viewer.controls.minDistance = 0;
           viewer.controls.maxDistance = Infinity;
         }
+
+        // Enable clipping on renderer
+        if (viewer.renderer) {
+          viewer.renderer.localClippingEnabled = true;
+        }
+
+        // Mark scene as loaded so effects can apply
+        setSceneLoaded(true);
+        console.log("Splat scene loaded, splatMesh:", viewer.splatMesh);
       })
       .catch(err => {
         console.error("Error loading splat scene:", err);
@@ -61,6 +75,113 @@ function Viewer({ url }) {
       viewer.dispose();
     };
   }, [url]);
+
+  // Depth range filtering is not supported by the GaussianSplats3D shader
+  // The shader doesn't include clipping plane support
+  // This would require modifying the library's GLSL shaders
+  useEffect(() => {
+    if (!sceneLoaded) return;
+    const viewer = viewerRef.current;
+    if (!viewer) return;
+
+    // Set camera planes wide to ensure full visibility
+    if (viewer.camera) {
+      viewer.camera.near = 0.01;
+      viewer.camera.far = 1000;
+      viewer.camera.updateProjectionMatrix();
+    }
+
+    console.log("Depth range UI value:", depthRange, "(filtering not supported by splat shader)");
+  }, [sceneLoaded, depthRange]);
+
+  // Apply depth stretch by modifying the scene's scale and updating transforms
+  useEffect(() => {
+    if (!sceneLoaded) return;
+    const viewer = viewerRef.current;
+    if (!viewer || !viewer.splatMesh) return;
+
+    console.log("Applying depth stretch:", depthStretch);
+
+    try {
+      // Method 1: Try modifying the scene's internal scale
+      const sceneCount = viewer.splatMesh.getSceneCount();
+      if (sceneCount > 0) {
+        for (let i = 0; i < sceneCount; i++) {
+          const scene = viewer.splatMesh.getScene(i);
+          if (scene && scene.scale) {
+            // Modify Z scale for depth stretch
+            scene.scale.set(
+              baseScaleRef.current[0],
+              baseScaleRef.current[1],
+              baseScaleRef.current[2] * depthStretch
+            );
+          }
+        }
+        // Update the transforms to apply the new scale
+        viewer.splatMesh.updateTransforms();
+        console.log("Applied depth stretch via scene transform");
+      }
+
+      // Method 2: Also set mesh scale as fallback
+      viewer.splatMesh.scale.set(
+        1,
+        1,
+        depthStretch
+      );
+    } catch (e) {
+      console.error("Error applying depth stretch:", e);
+      // Fallback: just set mesh scale
+      viewer.splatMesh.scale.set(
+        baseScaleRef.current[0],
+        baseScaleRef.current[1],
+        baseScaleRef.current[2] * depthStretch
+      );
+    }
+  }, [sceneLoaded, depthStretch]);
+
+  // Handle click for depth detection from origin
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const handleClick = (event) => {
+      const viewer = viewerRef.current;
+      if (!viewer || !viewer.raycaster || !viewer.splatMesh || !viewer.camera) return;
+
+      const rect = container.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+
+      const renderDimensions = { x: rect.width, y: rect.height };
+      const mousePosition = { x: mouseX, y: mouseY };
+
+      try {
+        viewer.raycaster.setFromCameraAndScreenPosition(viewer.camera, mousePosition, renderDimensions);
+        const outHits = [];
+        viewer.raycaster.intersectSplatMesh(viewer.splatMesh, outHits);
+
+        if (outHits.length > 0) {
+          const hit = outHits[0];
+          const hitPoint = hit.origin;
+
+          // Calculate depth from origin (0,0,0) along Z-axis
+          const depthFromOrigin = Math.abs(hitPoint.z);
+
+          // Account for scale factor
+          const actualDepth = depthFromOrigin / baseScaleRef.current[2];
+
+          if (onSplatClick && actualDepth >= 0) {
+            onSplatClick(actualDepth, { x: event.clientX, y: event.clientY });
+          }
+        }
+      } catch (e) {
+        console.error("Raycasting error:", e);
+      }
+    };
+
+    container.addEventListener('click', handleClick);
+    return () => container.removeEventListener('click', handleClick);
+  }, [onSplatClick, sceneLoaded]);
 
   return (
     <div ref={containerRef} className="w-full h-full" />
@@ -81,25 +202,35 @@ function SidebarItem({ item, isSelected, onClick, onClickDownload }) {
             `}
       onClick={onClick}
     >
-      <div className="flex items-center gap-3 mb-2">
-        <div className={`p-2 rounded-lg ${item.status === 'Complete' ? 'bg-green-500/20 text-green-400' : 'bg-slate-700 text-slate-400'}`}>
-          {item.status === 'Complete' ? <Box className="w-4 h-4" /> : <ImageIcon className="w-4 h-4" />}
-        </div>
+      <div className="flex items-center gap-3">
+        {item.imageUrl ? (
+          <div className="w-10 h-10 rounded-lg overflow-hidden border border-slate-700 shrink-0">
+            <img src={item.imageUrl} alt="" className="w-full h-full object-cover" />
+          </div>
+        ) : (
+          <div className={`p-2 rounded-lg shrink-0 ${item.status === 'Complete' ? 'bg-green-500/20 text-green-400' : 'bg-indigo-500/20 text-indigo-400'}`}>
+            {item.status === 'Complete' ? <Box className="w-5 h-5" /> : <Loader2 className="w-5 h-5 animate-spin" />}
+          </div>
+        )}
         <div className="flex-1 min-w-0">
-          <h4 className="font-medium text-sm truncate text-slate-200">{item.file.name}</h4>
+          <h4 className="font-medium text-sm truncate text-slate-200">
+            {item.file ? item.file.name : item.id.substring(0, 8)}
+          </h4>
           <p className="text-xs text-slate-500 truncate">{item.status}</p>
         </div>
         {item.status === 'Complete' && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onClickDownload(item);
-            }}
-            className="p-2 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"
-            title="Download / Compress"
-          >
-            <Download className="w-4 h-4" />
-          </button>
+          <div className="flex gap-1">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onClickDownload(item);
+              }}
+              className="p-1.5 hover:bg-slate-700 rounded-lg text-slate-400 hover:text-white transition-colors"
+              title="Download / Compress"
+            >
+              <Download className="w-4 h-4" />
+            </button>
+          </div>
         )}
       </div>
 
@@ -297,7 +428,320 @@ function CompressionModal({ item, onClose }) {
   );
 }
 
-function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatus }) {
+
+function DepthControlsPanel({ depthRange, onDepthRangeChange, depthStretch, onDepthStretchChange, isOpen, onToggle, onApplyChanges, isApplying, applyProgress, applyMessage }) {
+  const minDepth = 0.1;
+  const maxDepth = 100;
+  const minStretch = 0.1;
+  const maxStretch = 3;
+
+  return (
+    <div className="absolute top-4 right-4 z-10">
+      <button
+        onClick={onToggle}
+        className={`p-2.5 rounded-xl transition-all shadow-lg ${isOpen
+          ? 'bg-indigo-600 text-white'
+          : 'bg-slate-800/90 text-slate-300 hover:bg-slate-700 border border-slate-700'
+          }`}
+        title="Depth Controls"
+      >
+        <Sliders className="w-5 h-5" />
+      </button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: -10, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.95 }}
+            className="absolute top-12 right-0 bg-slate-800/95 backdrop-blur-sm border border-slate-700 rounded-xl p-5 w-72 shadow-2xl"
+          >
+            <h3 className="text-white font-bold text-sm mb-4 flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-indigo-400" />
+              Depth Controls
+            </h3>
+
+            {/* Depth Range Slider */}
+            <div className="mb-5">
+              <div className="flex justify-between items-center text-xs mb-2">
+                <label className="text-slate-300 font-medium">Depth Range</label>
+                <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
+                  {depthRange[0].toFixed(1)} - {depthRange[1].toFixed(1)}m
+                </span>
+              </div>
+              <div className="relative h-6 flex items-center">
+                {/* Track background */}
+                <div className="absolute w-full h-2 bg-slate-700 rounded-full" />
+                {/* Track fill between thumbs */}
+                <div
+                  className="absolute h-2 bg-indigo-500 rounded-full"
+                  style={{
+                    left: `${((depthRange[0] - minDepth) / (maxDepth - minDepth)) * 100}%`,
+                    right: `${100 - ((depthRange[1] - minDepth) / (maxDepth - minDepth)) * 100}%`
+                  }}
+                />
+                {/* Min thumb input - positioned at left half */}
+                <input
+                  type="range"
+                  min={minDepth}
+                  max={maxDepth}
+                  step="0.1"
+                  value={depthRange[0]}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (val < depthRange[1] - 0.5) {
+                      onDepthRangeChange([val, depthRange[1]]);
+                    }
+                  }}
+                  className="absolute w-full h-2 appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:cursor-grab [&::-webkit-slider-thumb]:active:cursor-grabbing [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:bg-indigo-500 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-lg [&::-moz-range-thumb]:cursor-grab"
+                  style={{ zIndex: 3 }}
+                />
+                {/* Max thumb input - positioned at right half */}
+                <input
+                  type="range"
+                  min={minDepth}
+                  max={maxDepth}
+                  step="0.1"
+                  value={depthRange[1]}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    if (val > depthRange[0] + 0.5) {
+                      onDepthRangeChange([depthRange[0], val]);
+                    }
+                  }}
+                  className="absolute w-full h-2 appearance-none bg-transparent cursor-pointer pointer-events-none [&::-webkit-slider-thumb]:pointer-events-auto [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white [&::-webkit-slider-thumb]:shadow-lg [&::-webkit-slider-thumb]:cursor-grab [&::-webkit-slider-thumb]:active:cursor-grabbing [&::-moz-range-thumb]:pointer-events-auto [&::-moz-range-thumb]:appearance-none [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4 [&::-moz-range-thumb]:bg-indigo-500 [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white [&::-moz-range-thumb]:shadow-lg [&::-moz-range-thumb]:cursor-grab"
+                  style={{ zIndex: 4 }}
+                />
+              </div>
+              <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                <span>{minDepth}m</span>
+                <span>Filters splats by depth from origin</span>
+                <span>{maxDepth}m</span>
+              </div>
+              <p className="text-[9px] text-slate-400 italic mt-1">
+                💡 Click "Apply Changes" to bake settings into a new file
+              </p>
+            </div>
+
+            {/* Depth Stretch Slider */}
+            <div>
+              <div className="flex justify-between items-center text-xs mb-2">
+                <label className="text-slate-300 font-medium">Depth Stretch</label>
+                <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
+                  {depthStretch.toFixed(2)}x
+                </span>
+              </div>
+              <input
+                type="range"
+                min={minStretch}
+                max={maxStretch}
+                step="0.01"
+                value={depthStretch}
+                onChange={(e) => onDepthStretchChange(parseFloat(e.target.value))}
+                className="w-full accent-indigo-500"
+              />
+              <div className="flex justify-between text-[10px] text-slate-500 mt-1">
+                <span>{minStretch}x</span>
+                <span>Z-axis scale</span>
+                <span>{maxStretch}x</span>
+              </div>
+            </div>
+
+            {/* Apply Changes Button */}
+            {isApplying ? (
+              <div className="mt-4 space-y-2">
+                <div className="flex justify-between text-xs text-slate-400">
+                  <span>{applyMessage || 'Processing...'}</span>
+                  <span>{Math.round(applyProgress || 0)}%</span>
+                </div>
+                <div className="h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                  <motion.div
+                    className="h-full bg-green-500"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${applyProgress || 0}%` }}
+                  />
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={onApplyChanges}
+                disabled={depthRange[0] === 0.1 && depthRange[1] === 100 && depthStretch === 1.0}
+                className={`w-full mt-4 py-2.5 text-sm font-semibold rounded-lg transition-all flex items-center justify-center gap-2 ${depthRange[0] === 0.1 && depthRange[1] === 100 && depthStretch === 1.0
+                  ? 'bg-slate-700/50 text-slate-500 cursor-not-allowed'
+                  : 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20'
+                  }`}
+                title="Recompute the splat with these depth settings baked in"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                Apply Changes
+              </button>
+            )}
+
+            {/* Reset Button */}
+            <button
+              onClick={() => {
+                onDepthRangeChange([0.1, 100]);
+                onDepthStretchChange(1.0);
+              }}
+              className="w-full mt-2 py-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 rounded-lg transition-colors"
+            >
+              Reset to Default
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function ViewerControlBar({ clickedDepth, onResetCamera }) {
+  return (
+    <div className="absolute bottom-6 left-6 z-10 flex items-center gap-3">
+      {/* Reset Camera Button */}
+      <button
+        onClick={onResetCamera}
+        className="flex items-center gap-2 px-4 py-2.5 bg-slate-800/90 hover:bg-slate-700 border border-slate-700 text-white rounded-xl font-semibold shadow-lg transition-all transform hover:-translate-y-0.5 active:translate-y-0 backdrop-blur-sm"
+        title="Reset Camera to Origin"
+      >
+        <RotateCcw className="w-4 h-4" />
+        Reset View
+      </button>
+
+      {/* Depth Infobox */}
+      <AnimatePresence>
+        {clickedDepth !== null && (
+          <motion.div
+            initial={{ opacity: 0, x: -10, scale: 0.95 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: -10, scale: 0.95 }}
+            className="bg-slate-800/90 backdrop-blur-sm border border-indigo-500/50 px-4 py-2.5 rounded-xl shadow-lg flex items-center gap-3"
+          >
+            <div className="text-[10px] text-slate-400 uppercase tracking-wider">Depth</div>
+            <div className="text-lg font-bold text-indigo-400 font-mono">
+              {clickedDepth.toFixed(2)} m
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatus, onItemUpdate }) {
+  const [depthRange, setDepthRange] = useState([0.1, 100]);
+  const [depthStretch, setDepthStretch] = useState(1.0);
+  const [depthControlsOpen, setDepthControlsOpen] = useState(false);
+  const [clickedDepth, setClickedDepth] = useState(null);
+  const [isApplyingDepth, setIsApplyingDepth] = useState(false);
+  const [applyProgress, setApplyProgress] = useState(0);
+  const [applyMessage, setApplyMessage] = useState('');
+  const tooltipTimeoutRef = useRef(null);
+  const viewerRef = useRef(null);
+
+  const handleSplatClick = (depth, position) => {
+    // Clear any existing timeout
+    if (tooltipTimeoutRef.current) {
+      clearTimeout(tooltipTimeoutRef.current);
+    }
+
+    setClickedDepth(depth);
+
+    // Auto-hide after 3 seconds
+    tooltipTimeoutRef.current = setTimeout(() => {
+      setClickedDepth(null);
+    }, 3000);
+  };
+
+  const handleResetCamera = () => {
+    const viewer = viewerRef.current;
+    if (!viewer || !viewer.camera || !viewer.controls) return;
+
+    // Reset camera to initial position
+    viewer.camera.position.set(0, 0, -5);
+    viewer.camera.lookAt(0, 0, 0);
+    if (viewer.controls.target) {
+      viewer.controls.target.set(0, 0, 0);
+    }
+    viewer.controls.update();
+  };
+
+  const handleApplyDepthChanges = async () => {
+    if (!selectedItem?.resultUrl) return;
+
+    setIsApplyingDepth(true);
+    setApplyProgress(0);
+    setApplyMessage('Starting...');
+
+    try {
+      const plyFilename = selectedItem.resultUrl.split('/').pop();
+
+      const response = await axios.post('/api/apply-depth-transforms', {
+        ply_filename: plyFilename,
+        depth_range: depthRange,
+        depth_stretch: depthStretch
+      });
+
+      const requestId = response.data.request_id;
+      if (!requestId) {
+        throw new Error(response.data.error || 'Failed to start depth transform');
+      }
+
+      // Listen to SSE for progress
+      const evtSource = new EventSource(`/api/events/${requestId}`);
+
+      evtSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.error) {
+          console.error("Depth transform error:", data.error);
+          alert('Depth transform failed: ' + data.error);
+          setIsApplyingDepth(false);
+          evtSource.close();
+          return;
+        }
+
+        if (data.status) {
+          setApplyMessage(data.status);
+          setApplyProgress(data.progress || 0);
+        }
+
+        if (data.url) {
+          // Update the selected item with the new URL
+          if (onItemUpdate) {
+            onItemUpdate(selectedItem.id, {
+              resultUrl: data.url,
+            });
+          }
+          setIsApplyingDepth(false);
+          setDepthControlsOpen(false);
+          // Reset sliders since changes are now baked in
+          setDepthRange([0.1, 100]);
+          setDepthStretch(1.0);
+          evtSource.close();
+        }
+      };
+
+      evtSource.onerror = (err) => {
+        console.error("SSE Error", err);
+        setIsApplyingDepth(false);
+        evtSource.close();
+      };
+
+    } catch (err) {
+      console.error('Depth transform error:', err);
+      alert('Failed to apply depth changes: ' + err.message);
+      setIsApplyingDepth(false);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (tooltipTimeoutRef.current) {
+        clearTimeout(tooltipTimeoutRef.current);
+      }
+    };
+  }, []);
+
   if (selectedItem && selectedItem.resultUrl && selectedItem.status === 'Complete') {
     const isConverting = meshConversionStatus?.itemId === selectedItem.id && meshConversionStatus?.status === 'converting';
     const meshUrl = selectedItem.meshUrl;
@@ -305,10 +749,38 @@ function MainArea({ selectedItem, onUpload, onConvertToMesh, meshConversionStatu
 
     return (
       <div className="flex-1 h-full relative bg-black">
-        <Viewer url={selectedItem.resultUrl} />
+        <Viewer
+          url={selectedItem.resultUrl}
+          depthRange={depthRange}
+          depthStretch={depthStretch}
+          onSplatClick={handleSplatClick}
+          viewerRefExternal={viewerRef}
+        />
         <div className="absolute top-4 left-4 pointer-events-none">
-          <h2 className="text-white font-bold drop-shadow-md">{selectedItem.file.name}</h2>
+          <h2 className="text-white font-bold drop-shadow-md">
+            {selectedItem.file ? selectedItem.file.name : selectedItem.id.substring(0, 8)}
+          </h2>
         </div>
+
+        {/* Depth Controls Panel */}
+        <DepthControlsPanel
+          depthRange={depthRange}
+          onDepthRangeChange={setDepthRange}
+          depthStretch={depthStretch}
+          onDepthStretchChange={setDepthStretch}
+          isOpen={depthControlsOpen}
+          onToggle={() => setDepthControlsOpen(!depthControlsOpen)}
+          onApplyChanges={handleApplyDepthChanges}
+          isApplying={isApplyingDepth}
+          applyProgress={applyProgress}
+          applyMessage={applyMessage}
+        />
+
+        {/* Viewer Control Bar (Reset Camera + Depth Info) */}
+        <ViewerControlBar
+          clickedDepth={clickedDepth}
+          onResetCamera={handleResetCamera}
+        />
 
         {/* Action buttons overlay */}
         <div className="absolute bottom-6 right-6 flex gap-3 pointer-events-auto">
@@ -396,6 +868,22 @@ function App() {
   const [queue, setQueue] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [compressionModalItem, setCompressionModalItem] = useState(null);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+
+  // Fetch history on mount
+  useEffect(() => {
+    const fetchHistory = async () => {
+      try {
+        const response = await axios.get('/api/history');
+        setQueue(response.data);
+      } catch (err) {
+        console.error("Failed to fetch history:", err);
+      } finally {
+        setIsLoadingHistory(false);
+      }
+    };
+    fetchHistory();
+  }, []);
 
   // Handle batch file selection
   const handleUpload = async (e) => {
@@ -407,7 +895,8 @@ function App() {
       status: 'Queued',
       progress: 0,
       resultUrl: null,
-      error: null
+      error: null,
+      imageUrl: URL.createObjectURL(file)
     }));
 
     setQueue(prev => [...newItems, ...prev]); // Add to top
@@ -478,6 +967,9 @@ function App() {
   };
   const updateItemMeshUrl = (id, meshUrl) => {
     setQueue(prev => prev.map(item => item.id === id ? { ...item, meshUrl } : item));
+  };
+  const updateItem = (id, updates) => {
+    setQueue(prev => prev.map(item => item.id === id ? { ...item, ...updates } : item));
   };
 
   // Mesh conversion
@@ -588,9 +1080,15 @@ function App() {
             ))}
           </AnimatePresence>
 
-          {queue.length === 0 && (
+          {queue.length === 0 && !isLoadingHistory && (
             <div className="text-center py-8 text-slate-600 text-sm">
               No generations yet.
+            </div>
+          )}
+
+          {isLoadingHistory && (
+            <div className="flex justify-center py-8">
+              <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
             </div>
           )}
         </div>
@@ -607,6 +1105,7 @@ function App() {
           onUpload={handleUpload}
           onConvertToMesh={handleConvertToMesh}
           meshConversionStatus={meshConversionStatus}
+          onItemUpdate={updateItem}
         />
       </main>
 
