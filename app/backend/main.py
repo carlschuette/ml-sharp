@@ -580,6 +580,135 @@ async def apply_depth_transforms(background_tasks: BackgroundTasks, request: dic
     
     return {"status": "queued", "request_id": request_id}
 
+
+def filter_splats_worker(ply_path: Path, output_path: Path, brightness_threshold: float, opacity_threshold: float, log_callback):
+    """Filter splats by brightness and opacity thresholds."""
+    from sharp.utils.gaussians import load_ply as load_gaussian_ply, save_ply, Gaussians3D
+    
+    log_callback("Loading Splat Data", 10)
+    gaussians, metadata = load_gaussian_ply(ply_path)
+    
+    log_callback("Calculating Brightness", 30)
+    
+    # Colors are in range [0, 1], shape: [1, N, 3]
+    colors = gaussians.colors  # RGB values
+    
+    # Calculate perceived brightness using luminance formula
+    # Y = 0.299*R + 0.587*G + 0.114*B
+    brightness = 0.299 * colors[0, :, 0] + 0.587 * colors[0, :, 1] + 0.114 * colors[0, :, 2]
+    
+    # Opacities are in range [0, 1], shape: [1, N]
+    opacities = gaussians.opacities[0, :]
+    
+    log_callback("Filtering Splats", 50)
+    
+    # Apply thresholds (thresholds are in 0-1 range)
+    brightness_mask = brightness >= brightness_threshold
+    opacity_mask = opacities >= opacity_threshold
+    mask = brightness_mask & opacity_mask
+    
+    # Count results
+    original_count = colors.shape[1]
+    kept_count = mask.sum().item()
+    removed_by_brightness = (~brightness_mask).sum().item()
+    removed_by_opacity = (~opacity_mask).sum().item()
+    
+    LOGGER.info(f"Filter results: keeping {kept_count}/{original_count} splats")
+    LOGGER.info(f"  - Removed by brightness < {brightness_threshold:.3f}: {removed_by_brightness}")
+    LOGGER.info(f"  - Removed by opacity < {opacity_threshold:.3f}: {removed_by_opacity}")
+    
+    log_callback(f"Kept {kept_count}/{original_count} splats", 70)
+    
+    # Apply mask to all Gaussian properties
+    filtered_gaussians = Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[:, mask, :],
+        quaternions=gaussians.quaternions[:, mask, :],
+        singular_values=gaussians.singular_values[:, mask, :],
+        opacities=gaussians.opacities[:, mask],
+        colors=gaussians.colors[:, mask, :],
+    )
+    
+    log_callback("Saving Filtered PLY", 85)
+    
+    # Save the filtered PLY
+    save_ply(filtered_gaussians, metadata.focal_length_px, metadata.resolution_px, output_path)
+    
+    log_callback("Complete", 100)
+    return kept_count, original_count
+
+
+async def process_filter_task(request_id: str, ply_path: Path, output_path: Path, 
+                               brightness_threshold: float, opacity_threshold: float, loop: asyncio.AbstractEventLoop):
+    try:
+        def log(msg, pct):
+            if request_id in status_queues:
+                loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": msg, "progress": pct}))
+
+        # Run the heavy lifting in a separate thread
+        kept_count, original_count = await loop.run_in_executor(
+            None, filter_splats_worker, ply_path, output_path, brightness_threshold, opacity_threshold, log
+        )
+
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
+            "status": "Complete", 
+            "progress": 100, 
+            "url": f"/outputs/{output_path.name}",
+            "kept_count": kept_count,
+            "original_count": original_count
+        }))
+    except Exception as e:
+        LOGGER.error(f"Filter failed: {e}")
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": str(e)}))
+    finally:
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, None)
+
+
+@app.post("/filter-splats")
+async def filter_splats(background_tasks: BackgroundTasks, request: dict):
+    """Filter splats by brightness and opacity thresholds."""
+    ply_filename = request.get("ply_filename")
+    brightness_threshold = request.get("brightness_threshold", 0.0)  # 0-1 range
+    opacity_threshold = request.get("opacity_threshold", 0.0)  # 0-1 range
+    
+    if not ply_filename:
+        return {"error": "ply_filename is required"}
+    
+    ply_path = OUTPUT_DIR / ply_filename
+    
+    # Handle ksplat files by using original PLY
+    if ply_path.suffix == '.ksplat':
+        possible_ply = ply_path.with_suffix('.ply')
+        if possible_ply.exists():
+            ply_path = possible_ply
+    
+    if not ply_path.exists():
+        return {"error": "PLY file not found"}
+    
+    # Generate output filename
+    base_name = ply_path.stem
+    # Remove any previous filter suffix
+    if "_filtered" in base_name:
+        base_name = base_name.split("_filtered")[0]
+    output_filename = f"{base_name}_filtered.ply"
+    output_path = OUTPUT_DIR / output_filename
+    
+    request_id = str(uuid.uuid4())
+    status_queues[request_id] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    
+    background_tasks.add_task(
+        process_filter_task, 
+        request_id, 
+        ply_path, 
+        output_path, 
+        float(brightness_threshold),
+        float(opacity_threshold),
+        loop
+    )
+    
+    return {"status": "queued", "request_id": request_id}
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 

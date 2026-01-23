@@ -253,26 +253,87 @@ function SidebarItem({ item, isSelected, onClick, onClickDownload }) {
 }
 
 function CompressionModal({ item, onClose }) {
+  const shDegree = 0; // Source PLY has no SH data
+
   const [compressionLevel, setCompressionLevel] = useState(1);
   const [alphaThreshold, setAlphaThreshold] = useState(1);
-  const [shDegree, setShDegree] = useState(0);
+  const [brightnessThreshold, setBrightnessThreshold] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportStatus, setExportStatus] = useState('');
 
   const handleExport = async () => {
     setIsExporting(true);
     setExportProgress(0);
+    setExportStatus('');
 
     try {
-      // GaussianSplats3D.PlyLoader.loadFromURL expects certain callbacks
-      const onProgress = (percent) => setExportProgress(percent);
+      // Determine the source URL - may need to filter first
+      let sourceUrl = item.resultUrl;
+      const needsFiltering = brightnessThreshold > 0;
+
+      if (needsFiltering) {
+        // Call backend to filter the PLY first
+        setExportStatus('Filtering splats...');
+        const plyFilename = item.resultUrl.split('/').pop();
+
+        const filterResponse = await axios.post('/api/filter-splats', {
+          ply_filename: plyFilename,
+          brightness_threshold: brightnessThreshold / 255, // Convert to 0-1 range
+          opacity_threshold: 0 // We use the library's alpha threshold instead
+        });
+
+        if (filterResponse.data.error) {
+          throw new Error(filterResponse.data.error);
+        }
+
+        const requestId = filterResponse.data.request_id;
+
+        // Wait for filtering to complete via SSE
+        await new Promise((resolve, reject) => {
+          const evtSource = new EventSource(`/api/events/${requestId}`);
+
+          evtSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+
+            if (data.error) {
+              evtSource.close();
+              reject(new Error(data.error));
+              return;
+            }
+
+            if (data.status) {
+              setExportStatus(data.status);
+              setExportProgress(data.progress * 0.3); // First 30% is filtering
+            }
+
+            if (data.url) {
+              sourceUrl = data.url;
+              evtSource.close();
+              resolve();
+            }
+          };
+
+          evtSource.onerror = () => {
+            evtSource.close();
+            reject(new Error('Filter connection failed'));
+          };
+        });
+      }
+
+      // Now convert to ksplat
+      setExportStatus('Converting to .ksplat...');
+      const onProgress = (percent) => {
+        const baseProgress = needsFiltering ? 30 : 0;
+        setExportProgress(baseProgress + percent * (needsFiltering ? 0.7 : 1));
+      };
       const progressiveLoad = false;
       const onProgressiveLoadSectionProgress = null;
       const optimizeSplatData = true;
       const headers = null;
 
       const splatBuffer = await GaussianSplats3D.PlyLoader.loadFromURL(
-        item.resultUrl,
+        sourceUrl,
         onProgress,
         progressiveLoad,
         onProgressiveLoadSectionProgress,
@@ -283,7 +344,14 @@ function CompressionModal({ item, onClose }) {
         headers
       );
 
-      const filename = item.file.name.replace(/\.[^/.]+$/, "") + ".ksplat";
+      // Get filename - use original name if item.file exists, otherwise use ID
+      let filename;
+      if (item.file && item.file.name) {
+        filename = item.file.name.replace(/\.[^/.]+$/, "") + ".ksplat";
+      } else {
+        filename = (item.id || 'splat').substring(0, 8) + ".ksplat";
+      }
+
       GaussianSplats3D.KSplatLoader.downloadFile(splatBuffer, filename);
       onClose();
     } catch (err) {
@@ -328,13 +396,13 @@ function CompressionModal({ item, onClose }) {
           {/* Compression Level */}
           <div className="space-y-3">
             <div className="flex justify-between items-center text-sm">
-              <label className="text-slate-300 font-medium">Compression Level</label>
-              <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
-                Level {compressionLevel}
+              <label className="text-slate-300 font-medium">Precision</label>
+              <span className="text-green-400 font-mono bg-green-500/10 px-2 py-0.5 rounded text-xs">
+                {compressionLevel === 0 ? 'Lossless' : 'Optimized'}
               </span>
             </div>
             <div className="flex gap-2">
-              {[0, 1, 2].map(level => (
+              {[0, 1].map(level => (
                 <button
                   key={level}
                   onClick={() => setCompressionLevel(level)}
@@ -343,21 +411,47 @@ function CompressionModal({ item, onClose }) {
                     : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
                     }`}
                 >
-                  {level === 0 ? 'None' : level === 1 ? '16-bit' : '8-bit'}
+                  {level === 0 ? 'Lossless (32-bit)' : 'Compressed (16-bit)'}
                 </button>
               ))}
             </div>
             <p className="text-[10px] text-slate-500 italic">
-              {compressionLevel === 0 && "Lossless conversion. Large file size."}
-              {compressionLevel === 1 && "Optimized 16-bit precision. Recommended."}
-              {compressionLevel === 2 && "Maximum 8-bit compression. Smallest size."}
+              {compressionLevel === 0
+                ? "Full 32-bit precision. Larger file size (~2x), maximum quality."
+                : "16-bit positions & scales. ~50% smaller, visually identical."}
             </p>
+          </div>
+
+          {/* Brightness Threshold */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-center text-sm">
+              <label className="text-slate-300 font-medium">Brightness Threshold</label>
+              <span className="text-amber-400 font-mono bg-amber-500/10 px-2 py-0.5 rounded">
+                {brightnessThreshold}/255
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="128"
+              value={brightnessThreshold}
+              onChange={(e) => setBrightnessThreshold(parseInt(e.target.value))}
+              className="w-full accent-amber-500"
+            />
+            <p className="text-[10px] text-slate-500 italic">
+              Removes dim/dark splats. Useful for reducing file size without losing visible detail.
+            </p>
+            {brightnessThreshold > 10 && (
+              <p className="text-[9px] text-amber-500/80 italic">
+                Splats darker than {Math.round((brightnessThreshold / 255) * 100)}% brightness will be removed
+              </p>
+            )}
           </div>
 
           {/* Alpha Threshold */}
           <div className="space-y-3">
             <div className="flex justify-between items-center text-sm">
-              <label className="text-slate-300 font-medium">Alpha Threshold</label>
+              <label className="text-slate-300 font-medium">Opacity Threshold</label>
               <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
                 {alphaThreshold}/255
               </span>
@@ -365,36 +459,19 @@ function CompressionModal({ item, onClose }) {
             <input
               type="range"
               min="0"
-              max="255"
+              max="128"
               value={alphaThreshold}
               onChange={(e) => setAlphaThreshold(parseInt(e.target.value))}
               className="w-full accent-indigo-500"
             />
-            <p className="text-[10px] text-slate-500 italic"> Removes splats with opacity lower than this value. Improves performance. </p>
-          </div>
-
-          {/* SH Degree */}
-          <div className="space-y-3">
-            <div className="flex justify-between items-center text-sm">
-              <label className="text-slate-300 font-medium">Spherical Harmonics</label>
-              <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded">
-                Degree {shDegree}
-              </span>
-            </div>
-            <div className="flex gap-2">
-              {[0, 1, 2].map(deg => (
-                <button
-                  key={deg}
-                  onClick={() => setShDegree(deg)}
-                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-all ${shDegree === deg
-                    ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
-                    : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
-                    }`}
-                >
-                  Deg {deg}
-                </button>
-              ))}
-            </div>
+            <p className="text-[10px] text-slate-500 italic">
+              Removes transparent/faint splats. Higher values = smaller file & faster loading.
+            </p>
+            {alphaThreshold > 20 && (
+              <p className="text-[9px] text-indigo-400/80 italic">
+                Splats with opacity below {Math.round((alphaThreshold / 255) * 100)}% will be removed
+              </p>
+            )}
           </div>
         </div>
 
@@ -402,7 +479,7 @@ function CompressionModal({ item, onClose }) {
           {isExporting ? (
             <div className="space-y-2">
               <div className="flex justify-between text-xs text-slate-400 mb-1">
-                <span>Optimizing and compressing...</span>
+                <span>{exportStatus || 'Processing...'}</span>
                 <span>{Math.round(exportProgress)}%</span>
               </div>
               <div className="h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
