@@ -4,6 +4,7 @@ import shutil
 import uuid
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -708,6 +709,115 @@ async def filter_splats(background_tasks: BackgroundTasks, request: dict):
     
     return {"status": "queued", "request_id": request_id}
 
+
+@app.post("/convert-format")
+async def convert_format(background_tasks: BackgroundTasks, request: dict):
+    """Convert a PLY file to another format (SPZ, SOG, etc.) using 3dgsconverter."""
+    ply_filename = request.get("ply_filename")
+    target_format = request.get("format")
+    options = request.get("options", {})
+    
+    if not ply_filename:
+        return {"error": "ply_filename is required"}
+    if not target_format:
+        return {"error": "format is required"}
+        
+    ply_path = OUTPUT_DIR / ply_filename
+    
+    # Handle ksplat input if passed (use original ply)
+    if ply_path.suffix == '.ksplat':
+         possible_ply = ply_path.with_suffix('.ply')
+         if possible_ply.exists():
+             ply_path = possible_ply
+    
+    if not ply_path.exists():
+        return {"error": "PLY file not found"}
+        
+    # Generate output filename
+    # Remove extension and add new one
+    output_filename = f"{ply_path.stem}.{target_format}"
+    output_path = OUTPUT_DIR / output_filename
+    
+    request_id = str(uuid.uuid4())
+    status_queues[request_id] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    
+    background_tasks.add_task(
+        process_conversion_task, 
+        request_id, 
+        ply_path, 
+        output_path, 
+        target_format,
+        options,
+        loop
+    )
+    
+    return {"status": "queued", "request_id": request_id}
+
+async def process_conversion_task(request_id: str, ply_path: Path, output_path: Path, 
+                                   target_format: str, options: dict, loop: asyncio.AbstractEventLoop):
+    try:
+        def log(msg, pct):
+            if request_id in status_queues:
+                loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": msg, "progress": pct}))
+
+        log(f"Starting {target_format.upper()} Conversion", 5)
+        
+        # Build command
+        # Find 3dgsconverter in the same directory as python executable (venv/bin)
+        python_bin_dir = Path(sys.executable).parent
+        converter_exec = "3dgsconverter" # default fallback to path
+        
+        possible_paths = [
+            python_bin_dir / "3dgsconverter",
+            python_bin_dir / "3dgsconverter.exe"
+        ]
+        
+        for p in possible_paths:
+            if p.exists():
+                converter_exec = str(p)
+                break
+        
+        cmd = [converter_exec, "--input", str(ply_path), "--output", str(output_path), "--force"]
+        
+        # Add options
+        if "compression_level" in options:
+             cmd.extend(["--compression_level", str(options["compression_level"])])
+        
+        # If the tool supports target format explicitly (it seems it infers from output, but let's check)
+        # help said: [--target_format TARGET_FORMAT]
+        cmd.extend(["--target_format", target_format])
+
+        log("Running Converter Tool", 20)
+        LOGGER.info(f"Running conversion command: {' '.join(cmd)}")
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Wait for process
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            error_msg = stderr.decode()
+            LOGGER.error(f"Conversion failed: {error_msg}")
+            raise Exception(f"Conversion tool failed: {error_msg}")
+            
+        log("Conversion Complete", 100)
+        
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({
+            "status": "Complete", 
+            "progress": 100, 
+            "url": f"/outputs/{output_path.name}"
+        }))
+        
+    except Exception as e:
+        LOGGER.error(f"Conversion failed: {e}")
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, json.dumps({"status": "Error", "error": str(e)}))
+    finally:
+        loop.call_soon_threadsafe(status_queues[request_id].put_nowait, None)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

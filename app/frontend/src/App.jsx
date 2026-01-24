@@ -255,7 +255,9 @@ function SidebarItem({ item, isSelected, onClick, onClickDownload }) {
 function CompressionModal({ item, onClose }) {
   const shDegree = 0; // Source PLY has no SH data
 
-  const [compressionLevel, setCompressionLevel] = useState(1);
+  const [format, setFormat] = useState('ksplat');
+  const [compressionLevel, setCompressionLevel] = useState(1); // KSplat specific (0/1)
+  const [compressionStrength, setCompressionStrength] = useState(1); // SOG/SPZ specific (0-9)
   const [alphaThreshold, setAlphaThreshold] = useState(1);
   const [brightnessThreshold, setBrightnessThreshold] = useState(0);
   const [isExporting, setIsExporting] = useState(false);
@@ -321,7 +323,72 @@ function CompressionModal({ item, onClose }) {
         });
       }
 
-      // Now convert to ksplat
+      if (format !== 'ksplat') {
+        // Backend conversion for SPZ/SOG
+        setExportStatus(`Converting to .${format}...`);
+
+        const plyFilename = sourceUrl.split('/').pop();
+
+        const payload = {
+          ply_filename: plyFilename,
+          format: format,
+          options: {
+            compression_level: compressionStrength
+          }
+        };
+
+        const response = await axios.post('/api/convert-format', payload);
+
+        if (response.data.error) throw new Error(response.data.error);
+
+        const requestId = response.data.request_id;
+        let downloadUrl = null;
+
+        await new Promise((resolve, reject) => {
+          const evtSource = new EventSource(`/api/events/${requestId}`);
+
+          evtSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.error) {
+              evtSource.close();
+              reject(new Error(data.error));
+              return;
+            }
+            if (data.status) {
+              setExportStatus(data.status);
+              // Map progress from 30-100 if filtered, or 0-100
+              const base = needsFiltering ? 30 : 0;
+              const scale = needsFiltering ? 0.7 : 1;
+              setExportProgress(base + (data.progress * scale));
+            }
+            if (data.url) {
+              downloadUrl = data.url;
+              evtSource.close();
+              resolve();
+            }
+          };
+
+          evtSource.onerror = () => {
+            evtSource.close();
+            reject(new Error('Conversion connection failed'));
+          };
+        });
+
+        // Trigger download
+        if (downloadUrl) {
+          const link = document.createElement('a');
+          link.href = downloadUrl;
+          link.download = downloadUrl.split('/').pop();
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+
+        onClose();
+        return;
+      }
+
+      // KSplat conversion (Client-side)
       setExportStatus('Converting to .ksplat...');
       const onProgress = (percent) => {
         const baseProgress = needsFiltering ? 30 : 0;
@@ -383,8 +450,8 @@ function CompressionModal({ item, onClose }) {
               <Settings className="w-5 h-5 text-indigo-400" />
             </div>
             <div>
-              <h3 className="font-bold text-lg text-white">Compress & Download</h3>
-              <p className="text-xs text-slate-400">Configure .ksplat export settings</p>
+              <h3 className="font-bold text-lg text-white">Download Splat</h3>
+              <p className="text-xs text-slate-400">Configure export settings</p>
             </div>
           </div>
           <button onClick={onClose} className="p-2 hover:bg-slate-700 rounded-full text-slate-400 transition-colors">
@@ -393,34 +460,83 @@ function CompressionModal({ item, onClose }) {
         </div>
 
         <div className="p-6 space-y-6">
-          {/* Compression Level */}
+
+          {/* Format Selection */}
           <div className="space-y-3">
-            <div className="flex justify-between items-center text-sm">
-              <label className="text-slate-300 font-medium">Precision</label>
-              <span className="text-green-400 font-mono bg-green-500/10 px-2 py-0.5 rounded text-xs">
-                {compressionLevel === 0 ? 'Lossless' : 'Optimized'}
-              </span>
-            </div>
+            <label className="text-slate-300 font-medium text-sm">Format</label>
             <div className="flex gap-2">
-              {[0, 1].map(level => (
+              {['ksplat', 'spz', 'sog'].map((fmt) => (
                 <button
-                  key={level}
-                  onClick={() => setCompressionLevel(level)}
-                  className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-all ${compressionLevel === level
-                    ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
-                    : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                  key={fmt}
+                  onClick={() => setFormat(fmt)}
+                  className={`flex-1 py-2 rounded-lg text-xs font-bold uppercase border transition-all ${format === fmt
+                      ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                      : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
                     }`}
                 >
-                  {level === 0 ? 'Lossless (32-bit)' : 'Compressed (16-bit)'}
+                  .{fmt}
                 </button>
               ))}
             </div>
-            <p className="text-[10px] text-slate-500 italic">
-              {compressionLevel === 0
-                ? "Full 32-bit precision. Larger file size (~2x), maximum quality."
-                : "16-bit positions & scales. ~50% smaller, visually identical."}
-            </p>
           </div>
+
+          {/* Compression Level - Only for KSplat */}
+          {format === 'ksplat' && (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center text-sm">
+                <label className="text-slate-300 font-medium">Precision</label>
+                <span className="text-green-400 font-mono bg-green-500/10 px-2 py-0.5 rounded text-xs">
+                  {compressionLevel === 0 ? 'Lossless' : 'Optimized'}
+                </span>
+              </div>
+              <div className="flex gap-2">
+                {[0, 1].map(level => (
+                  <button
+                    key={level}
+                    onClick={() => setCompressionLevel(level)}
+                    className={`flex-1 py-2 rounded-lg text-xs font-semibold border transition-all ${compressionLevel === level
+                      ? 'bg-indigo-600 border-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                      : 'bg-slate-700/50 border-slate-600 text-slate-400 hover:border-slate-500 hover:text-slate-200'
+                      }`}
+                  >
+                    {level === 0 ? 'Lossless (32-bit)' : 'Compressed (16-bit)'}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-slate-500 italic">
+                {compressionLevel === 0
+                  ? "Full 32-bit precision. Larger file size (~2x), maximum quality."
+                  : "16-bit positions & scales. ~50% smaller, visually identical."}
+              </p>
+            </div>
+          )}
+
+          {/* SOG/SPZ Settings */}
+          {(format === 'sog' || format === 'spz') && (
+            <div className="space-y-3">
+              <div className="flex justify-between items-center text-sm">
+                <label className="text-slate-300 font-medium">{format === 'sog' ? 'Quality / Tile Size' : 'Compression Level'}</label>
+                <span className="text-indigo-400 font-mono bg-indigo-500/10 px-2 py-0.5 rounded text-xs">
+                  Level {compressionStrength}
+                </span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="9"
+                step="1"
+                value={compressionStrength}
+                onChange={(e) => setCompressionStrength(parseInt(e.target.value))}
+                className="w-full accent-indigo-500"
+              />
+              <p className="text-[10px] text-slate-500 italic">
+                {format === 'sog'
+                  ? (compressionStrength < 4 ? "High Quality (64k)" : compressionStrength < 7 ? "Medium Quality (16k)" : "High Compression (4k)")
+                  : "Higher level means smaller file size but slower processing."}
+              </p>
+            </div>
+          )}
+
 
           {/* Brightness Threshold */}
           <div className="space-y-3">
@@ -496,7 +612,7 @@ function CompressionModal({ item, onClose }) {
               className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold shadow-lg shadow-indigo-500/20 transition-all transform hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-2"
             >
               <Download className="w-4 h-4" />
-              Download .ksplat
+              Download .{format}
             </button>
           )}
         </div>
